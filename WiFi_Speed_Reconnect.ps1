@@ -1,20 +1,21 @@
 ﻿# ============================================================
 #  WiFi Speed Test + Smart Reconnect (SVIST)  v3
 #  功能：测速（延迟/丢包/下载速度）+ 综合评分 + 逐轮对比，
-#        不达标时自动快速重连（不断开，1~3 秒内恢复），
-#        最多自动尝试 N 轮，保留最佳结果。
+#        达标（≥300Mbps）即停；不达标依次测满 3→6→10 轮，
+#        最终从所有轮次中选出网速最快的通道。
 #  用法：
-#    双击同目录下 WiFi测速重连.bat（自动跑三轮，无需确认）
+#    双击同目录下 WiFi测速重连.bat（自动测速重连，无需确认）
 #  可选参数（示例）：
-#    WiFi测速重连.bat -MinSpeedMbps 3 -MaxLatencyMs 150 -MaxTries 5
+#    WiFi测速重连.bat -MinSpeedMbps 300 -MaxLatencyMs 150 -MaxTries 10
+#    -MaxTries N  封顶轮数（默认 10，不达标依次测满 3→6→10 轮）
 #    -DryRun  只模拟重连不实际断网（用于测试）
 # ============================================================
 
 param(
     [int]$MaxLatencyMs = 200,
     [int]$MaxLossPercent = 20,
-    [int]$MinSpeedMbps = 5,
-    [int]$MaxTries = 3,
+    [int]$MinSpeedMbps = 300,   # 下载速度达标线(Mbps)：300 左右即可
+    [int]$MaxTries = 10,   # 封顶轮数：不达标依次测满 3→6→10 轮（默认 10）
     [switch]$DryRun
 )
 
@@ -83,10 +84,15 @@ function Test-DownloadSpeed {
 }
 
 # ---------- 4. 综合评分：延迟 40% + 速度 40% + 信号 20% ----------
+# 注意：必须显式使用 double，否则 PS5.1 会把 [math]::Max/Min 绑定到 (int,int) 重载
+#       导致 0.8 被四舍五入成 1、0.002 被舍成 0，得分失真（历史 bug）
 function Get-Score($latencyMs, $speedMbps, $signalPct) {
-    $l = $(if ($null -eq $latencyMs) { 0 } else { [math]::Max(0, 1 - $latencyMs / $MaxLatencyMs) })
-    $s = $(if ($null -eq $speedMbps) { 0 } else { [math]::Min(1, $speedMbps / 20) })
-    $sig = $(if ($null -eq $signalPct) { 0 } else { [math]::Min(1, $signalPct / 100) })
+    $l = 0.0
+    if ($null -ne $latencyMs) { $l = [math]::Max(0.0, 1.0 - ([double]$latencyMs / [double]$MaxLatencyMs)) }
+    $s = 0.0
+    if ($null -ne $speedMbps) { $s = [math]::Min(1.0, [double]$speedMbps / 300.0) }
+    $sig = 0.0
+    if ($null -ne $signalPct) { $sig = [math]::Min(1.0, [double]$signalPct / 100.0) }
     return [math]::Round(0.4 * $l + 0.4 * $s + 0.2 * $sig, 2)
 }
 
@@ -121,7 +127,7 @@ function Reconnect-Wifi([string]$SSID) {
 # ---------- 主流程（自动三轮，无需确认） ----------
 Write-Host '==================================================' -ForegroundColor Cyan
 Write-Host '   WiFi Speed Test + Smart Reconnect (SVIST) v3' -ForegroundColor Cyan
-Write-Host ('   （自动重连最多 {0} 轮，快速重连几乎不断网）' -f $MaxTries) -ForegroundColor Cyan
+Write-Host ('   （达标即停，不达标最多测 {0} 轮，选网速最快的通道）' -f $MaxTries) -ForegroundColor Cyan
 Write-Host '==================================================' -ForegroundColor Cyan
 
 $wifi = Get-WifiInfo
@@ -187,6 +193,14 @@ do {
 
     Write-Host ("  本轮不达标（得分 {0}）：{1}" -f $score, ($bad -join '；')) -ForegroundColor Red
 
+    # 阶段提示：第 3 轮 / 第 6 轮是检查点，未达标则进入下一阶段
+    if ($tries -lt $MaxTries -and ($tries -eq 3 -or $tries -eq 6)) {
+        $nextStage = [math]::Min(10, $MaxTries)
+        if ($tries -lt $nextStage) {
+            Write-Host ("  已测 {0} 轮仍未达标，继续测到第 {1} 轮" -f $tries, $nextStage) -ForegroundColor DarkYellow
+        }
+    }
+
     if ($tries -ge $MaxTries) {
         Write-Host ("  已达最大尝试次数 {0}，停止重连" -f $MaxTries) -ForegroundColor DarkGray
         break
@@ -200,14 +214,18 @@ Write-Host "`n========== 逐轮对比 ==========" -ForegroundColor Cyan
 $rounds | Format-Table -AutoSize | Out-String | Write-Host
 
 if ($rounds.Count -gt 0) {
-    $best = $rounds | Sort-Object 得分 -Descending | Select-Object -First 1
-    Write-Host ("最佳轮次 : 第 {0} 轮（得分 {1}）" -f $best.轮次, $best.得分) -ForegroundColor Green
+    # 最佳通道：以网速（下载速度）为准，速度最高的轮次胜出
+    $best = $rounds | Sort-Object @{ Expression = {
+        $v = $_.速度 -replace ' Mbps', ''
+        if ($v -eq 'N/A') { -1 } else { [double]$v }
+    } } -Descending | Select-Object -First 1
+    Write-Host ("最佳通道 : 第 {0} 轮（{1}，得分 {2}）" -f $best.轮次, $best.速度, $best.得分) -ForegroundColor Green
     if ($finalOk) {
         Write-Host '最终状态 : 网络达标 ✓' -ForegroundColor Green
     } else {
-        Write-Host '最终状态 : 三轮尝试后仍未达标，请检查路由器 / 宽带 / 信号遮挡' -ForegroundColor Red
+        Write-Host ("最终状态 : 尝试 {0} 轮后仍未达标（<{1}Mbps），请检查路由器 / 宽带 / 信号遮挡" -f $tries, $MinSpeedMbps) -ForegroundColor Red
         if ($best.轮次 -lt $tries) {
-            Write-Host ("提示 : 第 {0} 轮（当前连接）不如第 {1} 轮，可考虑换回更优状态" -f $tries, $best.轮次) -ForegroundColor Yellow
+            Write-Host ("提示 : 当前连接不如第 {0} 轮（{1}），该轮是网速最快的通道" -f $best.轮次, $best.速度) -ForegroundColor Yellow
         }
     }
 }

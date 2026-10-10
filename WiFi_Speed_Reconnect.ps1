@@ -1,20 +1,24 @@
 ﻿# ============================================================
 #  WiFi Speed Test + Smart Reconnect (SVIST)  v3
 #  功能：测速（延迟/丢包/下载速度）+ 综合评分 + 逐轮对比，
-#        达标（≥300Mbps）即停；不达标依次测满 3→6→10 轮，
+#        开头自动检测链路速率，按比例自动设置达标门槛，
+#        达标即停；不达标依次测满 3→6→10 轮，
 #        最终从所有轮次中选出网速最快的通道。
 #  用法：
 #    双击同目录下 WiFi测速重连.bat（自动测速重连，无需确认）
 #  可选参数（示例）：
-#    WiFi测速重连.bat -MinSpeedMbps 300 -MaxLatencyMs 150 -MaxTries 10
-#    -MaxTries N  封顶轮数（默认 10，不达标依次测满 3→6→10 轮）
-#    -DryRun  只模拟重连不实际断网（用于测试）
+#    WiFi测速重连.bat -LinkRatio 0.6 -MaxLatencyMs 150 -MaxTries 10
+#    -LinkRatio 0.6       自动门槛 = 链路速率 × 60%（默认）
+#    -MinSpeedMbps 300    手动指定达标线（默认 0 = 自动按链路比例）
+#    -MaxTries N          封顶轮数（默认 10，不达标依次测满 3→6→10 轮）
+#    -DryRun              只模拟重连不实际断网（用于测试）
 # ============================================================
 
 param(
     [int]$MaxLatencyMs = 200,
     [int]$MaxLossPercent = 20,
-    [int]$MinSpeedMbps = 300,   # 下载速度达标线(Mbps)：300 左右即可
+    [int]$MinSpeedMbps = 0,     # 手动达标线(Mbps)：0 = 自动按链路速率×LinkRatio
+    [double]$LinkRatio = 0.6,   # 自动门槛比例：链路速率 × 60%
     [int]$MaxTries = 10,   # 封顶轮数：不达标依次测满 3→6→10 轮（默认 10）
     [switch]$DryRun
 )
@@ -35,6 +39,16 @@ function Get-WifiInfo {
     $signalNum = 0
     if ($signal -match '(\d+)') { $signalNum = [int]$Matches[1] }
     return @{ SSID = $ssid; Signal = $signalNum; Band = $band; Rate = $rate }
+}
+
+# ---------- 1.5 解析链路速率（兼容 netsh 多种格式：'573.5'、'585 (Mbps)'、'866.7'） ----------
+function Get-LinkMbps([string]$rateText) {
+    if (-not $rateText) { return $null }
+    $m = [regex]::Match($rateText, '(\d+(?:\.\d+)?)')
+    if (-not $m.Success) { return $null }
+    $val = [double]$m.Groups[1].Value
+    if ($rateText -match 'Gbps') { $val = $val * 1000 }
+    return $val
 }
 
 # ---------- 2. 延迟 / 丢包测试（ping 10 次） ----------
@@ -90,7 +104,7 @@ function Get-Score($latencyMs, $speedMbps, $signalPct) {
     $l = 0.0
     if ($null -ne $latencyMs) { $l = [math]::Max(0.0, 1.0 - ([double]$latencyMs / [double]$MaxLatencyMs)) }
     $s = 0.0
-    if ($null -ne $speedMbps) { $s = [math]::Min(1.0, [double]$speedMbps / 300.0) }
+    if ($null -ne $speedMbps) { $s = [math]::Min(1.0, [double]$speedMbps / $speedCap) }
     $sig = 0.0
     if ($null -ne $signalPct) { $sig = [math]::Min(1.0, [double]$signalPct / 100.0) }
     return [math]::Round(0.4 * $l + 0.4 * $s + 0.2 * $sig, 2)
@@ -136,6 +150,22 @@ $bandShow = $(if ($wifi.Band) { $wifi.Band } else { '-' })
 $rateShow = $(if ($wifi.Rate) { $wifi.Rate } else { '-' })
 Write-Host ("当前 WiFi : {0}   信号 {1}%   频段 {2}   链路速率 {3}" -f $ssidShow, $wifi.Signal, $bandShow, $rateShow)
 
+# ---------- 自动门槛：检测链路速率 × LinkRatio；手动 -MinSpeedMbps 可覆盖 ----------
+$linkMbps = Get-LinkMbps $wifi.Rate
+$threshold = $MinSpeedMbps
+if ($threshold -le 0) {
+    if ($null -ne $linkMbps -and $linkMbps -gt 0) {
+        $threshold = [math]::Round($linkMbps * $LinkRatio)
+        Write-Host ("  链路速率 {0} Mbps → 达标门槛 {1} Mbps（链路的 {2}%）" -f $linkMbps, $threshold, [math]::Round($LinkRatio * 100)) -ForegroundColor Yellow
+    } else {
+        $threshold = 300
+        Write-Host '  未检测到链路速率，使用默认门槛 300 Mbps' -ForegroundColor Yellow
+    }
+} else {
+    Write-Host ("  手动达标门槛 {0} Mbps" -f $threshold) -ForegroundColor Yellow
+}
+$speedCap = [double]$threshold   # 评分速度满分线 = 达标门槛
+
 $gw = (Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Sort-Object RouteMetric | Select-Object -First 1).NextHop
 
 $rounds = @()
@@ -173,7 +203,7 @@ do {
     $bad = @()
     if ($null -ne $latencyNow -and $latencyNow -gt $MaxLatencyMs) { $bad += ("延迟 {0}ms > {1}ms" -f $latencyNow, $MaxLatencyMs) }
     if ($lossNow -gt $MaxLossPercent) { $bad += ("丢包 {0}% > {1}%" -f $lossNow, $MaxLossPercent) }
-    if ($null -ne $speed -and $speed -lt $MinSpeedMbps) { $bad += ("下载 {0}Mbps < {1}Mbps" -f $speed, $MinSpeedMbps) }
+    if ($null -ne $speed -and $speed -lt $threshold) { $bad += ("下载 {0}Mbps < {1}Mbps" -f $speed, $threshold) }
 
     $rounds += [pscustomobject]@{
         轮次 = $tries
@@ -223,7 +253,7 @@ if ($rounds.Count -gt 0) {
     if ($finalOk) {
         Write-Host '最终状态 : 网络达标 ✓' -ForegroundColor Green
     } else {
-        Write-Host ("最终状态 : 尝试 {0} 轮后仍未达标（<{1}Mbps），请检查路由器 / 宽带 / 信号遮挡" -f $tries, $MinSpeedMbps) -ForegroundColor Red
+        Write-Host ("最终状态 : 尝试 {0} 轮后仍未达标（<{1}Mbps），请检查路由器 / 宽带 / 信号遮挡" -f $tries, $threshold) -ForegroundColor Red
         if ($best.轮次 -lt $tries) {
             Write-Host ("提示 : 当前连接不如第 {0} 轮（{1}），该轮是网速最快的通道" -f $best.轮次, $best.速度) -ForegroundColor Yellow
         }

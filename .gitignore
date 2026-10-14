@@ -1,0 +1,10 @@
+# 测速结果数据
+wifi_bench_*.csv
+
+# 本地备份
+*_v3_backup.ps1
+*.bak
+
+# 系统文件
+Thumbs.db
+Desktop.ini

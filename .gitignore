@@ -1,5 +1,10 @@
 # 测速结果数据
 wifi_bench_*.csv
+wifi_v6_result.csv
+
+# 频段守卫的运行状态与日志
+band_guard_log.csv
+band_guard.pause
 
 # 本地备份
 *_v3_backup.ps1

@@ -1,0 +1,12 @@
+# 全部是 Windows 脚本，强制 CRLF，避免 clone 后 cmd 执行 goto 出错
+* text=auto
+
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+*.txt text eol=crlf
+*.csv text eol=crlf
+
+*.md  text eol=lf
+*.gitignore text eol=lf
+*.gitattributes text eol=lf
